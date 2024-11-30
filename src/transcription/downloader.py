@@ -1,5 +1,3 @@
-# transcription/downloader.py
-
 from __future__ import annotations
 import sys
 from pathlib import Path
@@ -15,6 +13,7 @@ from typing import Dict, Optional, Tuple
 import yt_dlp
 import shutil
 import re
+import unicodedata
 
 from models.tasks import TranscriptionTask, TaskStatus
 from config.settings import CONFIG
@@ -41,31 +40,7 @@ class VideoDownloader:
         self.retry_delay = CONFIG.get('retry_delay', 5)
         self.lock = threading.Lock()
 
-    def create_video_directory(self, video_id: str, title: str) -> Path:
-        """
-        Create a unique directory for the video using ID and sanitized title.
-
-        Args:
-            video_id (str): YouTube video ID
-            title (str): Video title
-
-        Returns:
-            Path: Path to the created directory
-        """
-        # Create a sanitized directory name using video ID and title
-        sanitized_title = self.sanitize_filename(title)
-        dir_name = f"{video_id}-{sanitized_title[:50]}"  # Limit length
-        video_dir = self.base_output_dir / dir_name
-
-        # Create directories for different content types
-        with self.lock:
-            video_dir.mkdir(exist_ok=True, parents=True)
-            (video_dir / "audio").mkdir(exist_ok=True)
-
-        return video_dir
-
-    @staticmethod
-    def sanitize_filename(filename: str) -> str:
+    def sanitize_filename(self, filename: str) -> str:
         """
         Create a clean, filesystem-safe filename.
 
@@ -77,21 +52,54 @@ class VideoDownloader:
         """
         if not filename:
             return "untitled"
-        # Remove invalid characters and replace spaces
-        clean_name = re.sub(r'[^\w\s-]', '', filename)
-        clean_name = re.sub(r'[-\s]+', '-', clean_name).strip('-')
-        return clean_name.lower()
+
+        # Normalize unicode characters
+        filename = unicodedata.normalize('NFKD', filename)
+        
+        # Convert to ASCII, dropping non-ASCII characters
+        filename = filename.encode('ASCII', 'ignore').decode()
+        
+        # Remove or replace problematic characters
+        filename = re.sub(r'[^\w\s-]', '', filename)
+        filename = re.sub(r'[-\s]+', '-', filename).strip('-')
+        
+        # Ensure the filename isn't too long
+        max_length = 100  # Reasonable maximum length
+        if len(filename) > max_length:
+            filename = filename[:max_length]
+            
+        # Ensure we have something valid
+        if not filename:
+            filename = "untitled"
+            
+        return filename.lower()
+
+    def create_video_directory(self, video_id: str, title: str) -> Path:
+        """
+        Create a unique directory for the video using ID and sanitized title.
+
+        Args:
+            video_id (str): YouTube video ID
+            title (str): Video title
+
+        Returns:
+            Path: Path to the created directory
+        """
+        sanitized_title = self.sanitize_filename(title)
+        dir_name = f"{video_id}-{sanitized_title[:50]}"
+        video_dir = self.base_output_dir / dir_name
+
+        with self.lock:
+            video_dir.mkdir(exist_ok=True, parents=True)
+            (video_dir / "audio").mkdir(exist_ok=True)
+            (video_dir / "chunks").mkdir(exist_ok=True)
+            (video_dir / "transcripts").mkdir(exist_ok=True)
+
+        return video_dir
 
     def prepare_download_options(self, task: TranscriptionTask, video_dir: Path) -> Dict:
         """
         Prepare yt-dlp options for video download.
-
-        Args:
-            task (TranscriptionTask): Current task
-            video_dir (Path): Video directory path
-
-        Returns:
-            Dict: yt-dlp options
         """
         def progress_hook(d):
             try:
@@ -109,7 +117,6 @@ class VideoDownloader:
 
                         if total > 0:
                             task.stats.progress = (downloaded / total) * 100
-                            # Add download speed and ETA to task metadata
                             task.metadata.update({
                                 'download_speed': f"{speed / 1024 / 1024:.2f} MB/s" if speed else "N/A",
                                 'time_remaining': f"{eta:.0f} seconds" if eta else "N/A",
@@ -121,16 +128,25 @@ class VideoDownloader:
                     with task._lock:
                         task.stats.progress = 100.0
                         task.metadata['download_completed_at'] = datetime.now().isoformat()
-                        filename = d['filename']
-                        task.temp_video_path = Path(filename)
-                        logger.info(f"Task {task.id}: Downloaded file saved to {filename}")
+                        filename = d.get('filename', '')
+                        if filename:
+                            logger.debug(f"Finished downloading file: {filename}")
+                            task.metadata['downloaded_filename'] = filename
+                            # Set the temp_video_path based on the final converted WAV file
+                            if filename.endswith('.webm'):
+                                wav_path = Path(filename).with_suffix('.wav')
+                                task.temp_video_path = wav_path
+                                logger.debug(f"Set temp_video_path to: {wav_path}")
 
             except Exception as e:
                 logger.error(f"Error in progress hook for Task {task.id}: {str(e)}")
 
+        # Sanitize the output template to avoid special characters
+        output_template = "%(id)s.%(ext)s"  # Simplified template using just the video ID
+
         return {
-            'format': 'bestvideo+bestaudio/best',
-            'outtmpl': str(video_dir / '%(title)s.%(ext)s'),
+            'format': 'bestaudio/best',
+            'outtmpl': str(video_dir / output_template),
             'progress_hooks': [progress_hook],
             'quiet': True,
             'noplaylist': True,
@@ -141,7 +157,11 @@ class VideoDownloader:
             'retry_sleep': self.retry_delay,
             'socket_timeout': CONFIG.get('api_timeout', 300),
             'max_filesize': CONFIG.get('max_file_size', None),
-            'merge_output_format': 'mp4',  # Ensures video and audio are merged
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'wav',
+                'preferredquality': '192',
+            }],
         }
 
     def save_metadata(self, task: TranscriptionTask, info: Dict, video_dir: Path) -> None:
@@ -149,7 +169,7 @@ class VideoDownloader:
         Save video metadata to JSON file.
 
         Args:
-            task (TranscriptionTask): The task containing video URL and metadata.
+            task (TranscriptionTask): The task containing video URL and metadata
             info (Dict): Video information from yt-dlp
             video_dir (Path): Video directory path
         """
@@ -172,14 +192,10 @@ class VideoDownloader:
             'video_url': info.get('webpage_url'),
             'format_id': info.get('format_id'),
             'ext': info.get('ext'),
-            'resolution': info.get('resolution'),
-            'fps': info.get('fps'),
             'audio_channels': info.get('audio_channels'),
             'filesize_approx': info.get('filesize_approx'),
-            'album': info.get('album'),
-            'artist': info.get('artist'),
-            'track': info.get('track'),
-            'release_year': info.get('release_year')
+            'duration_string': info.get('duration_string'),
+            'processed_title': self.sanitize_filename(info.get('title', '')),
         }
 
         metadata_path = video_dir / 'metadata.json'
@@ -187,66 +203,70 @@ class VideoDownloader:
             with open(metadata_path, 'w', encoding='utf-8') as f:
                 json.dump(metadata, f, indent=2, ensure_ascii=False)
             logger.info(f"Task {task.id}: Metadata saved to {metadata_path}")
+            
+            # Store key metadata in task
+            with task._lock:
+                task.metadata['video_metadata'] = metadata
+                task.title = metadata['processed_title']
+                
         except Exception as e:
             logger.error(f"Task {task.id}: Failed to save metadata to {metadata_path}: {e}")
 
     def download_video(self, task: TranscriptionTask) -> Tuple[bool, Optional[str]]:
-        logger.info(f"Task {task.id}: Starting download_video for URL: {task.url}")
-        try:
-            # Validate URL
-            logger.debug(f"Task {task.id}: Validating URL")
-            if not task.url or not task.url.strip():
-                error_msg = "Invalid or empty URL"
-                logger.error(f"Task {task.id}: {error_msg}")
+            """
+            Download video and extract audio.
+            """
+            logger.info(f"Task {task.id}: Starting download_video for URL: {task.url}")
+            try:
+                # Validate URL
+                if not task.url or not task.url.strip():
+                    return False, "Invalid or empty URL"
+
+                # Extract video info
+                with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+                    try:
+                        info = ydl.extract_info(task.url, download=False)
+                    except Exception as e:
+                        return False, f"Failed to fetch video info: {str(e)}"
+
+                video_id = info.get('id')
+                if not video_id:
+                    return False, "Could not retrieve video ID"
+
+                # Create directory structure
+                video_dir = self.create_video_directory(video_id, info.get('title', 'untitled'))
+                task.metadata['video_dir'] = str(video_dir)
+                
+                # Save metadata early
+                self.save_metadata(task, info, video_dir)
+
+                # Download the video/audio
+                ydl_opts = self.prepare_download_options(task, video_dir)
+                
+                # Download and convert to WAV
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([task.url])
+
+                # The expected WAV file path
+                expected_wav = video_dir / f"{video_id}.wav"
+                
+                # Verify the WAV file exists
+                if not expected_wav.exists():
+                    # Try to find any WAV file in the directory as fallback
+                    wav_files = list(video_dir.glob("*.wav"))
+                    if wav_files:
+                        expected_wav = wav_files[0]
+                        logger.info(f"Found alternative WAV file: {expected_wav}")
+                    else:
+                        return False, "WAV file not found after download and conversion"
+
+                # Set the final audio path
+                task.temp_video_path = expected_wav
+                logger.info(f"Task {task.id}: Audio file ready at {expected_wav}")
+
+                return True, None
+
+            except Exception as e:
+                error_msg = f"Unexpected error during video download: {str(e)}"
+                logger.exception(f"Task {task.id}: {error_msg}")
                 return False, error_msg
-
-            # Use yt_dlp to extract video info
-            logger.debug(f"Task {task.id}: Using yt_dlp to extract video info")
-            with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
-                try:
-                    info = ydl.extract_info(task.url, download=False)
-                    logger.debug(f"Task {task.id}: Video info extracted successfully")
-                except Exception as e:
-                    error_msg = f"Failed to fetch video info: {str(e)}"
-                    logger.exception(f"Task {task.id}: {error_msg}")
-                    return False, error_msg
-
-            video_id = info.get('id')
-            if not video_id:
-                error_msg = "Could not retrieve video ID from video info"
-                logger.error(f"Task {task.id}: {error_msg}")
-                return False, error_msg
-
-            logger.debug(f"Task {task.id}: Video ID is {video_id}")
-
-            # Create directories
-            video_dir = self.create_video_directory(video_id, info.get('title', 'untitled'))
-            task.metadata['video_dir'] = str(video_dir)
-            task.title = info.get('title', 'untitled')
-            task.video_metadata = info
-
-            # Prepare download options
-            ydl_opts = self.prepare_download_options(task, video_dir)
-
-            # Start the download
-            logger.debug(f"Task {task.id}: Starting video download")
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([task.url])
-
-            # After download completes
-            logger.debug(f"Task {task.id}: Video download completed successfully")
-
-            # Save metadata
-            self.save_metadata(task, info, video_dir)
-
-            return True, None
-        except Exception as e:
-            error_msg = f"Unexpected error during video download: {str(e)}"
-            logger.exception(f"Task {task.id}: {error_msg}")
-            with task._lock:
-                task.metadata['error'] = error_msg
-            # Do not call cleanup_failed_download here to prevent unintended deletions
-            # Cleanup should be handled cautiously and only when necessary
-            return False, error_msg
-
-    # Removed cleanup_failed_download method to prevent accidental deletions
