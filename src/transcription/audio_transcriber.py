@@ -129,9 +129,9 @@ class AudioTranscriber:
             if not temp_path.exists() or temp_path.stat().st_size == 0:
                 raise RuntimeError("Failed to create audio file")
 
-            # Get audio info
+            # Get audio info - Fixed variable name in logging
             audio_info = self.verify_audio(temp_path)
-            logger.debug(f"Audio info: {json_info}")
+            logger.debug(f"Audio info: {audio_info}")  # Fixed from json_info to audio_info
 
             # Cache the file if it's valid
             if temp_path.stat().st_size <= self.max_chunk_size:
@@ -308,3 +308,53 @@ class AudioTranscriber:
             )
         finally:
             loop.close()
+
+    def merge_transcripts(self, task: TranscriptionTask) -> bool:
+        """
+        Merge individual chunk transcriptions into a single transcript.
+        
+        Args:
+            task (TranscriptionTask): The task containing transcription metadata.
+            
+        Returns:
+            bool: True if merging is successful, False otherwise.
+        """
+        try:
+            transcripts_dir = Path(task.metadata.get('transcripts_dir', ''))
+            if not transcripts_dir.exists():
+                raise FileNotFoundError("Transcripts directory not found")
+
+            # Collect all JSON transcript files
+            json_files = sorted(transcripts_dir.glob("*.json"))
+            if not json_files:
+                raise ValueError("No transcripts found to merge")
+
+            merged_text = []
+            merged_metadata = {
+                'chunks': [],
+                'task_id': task.id,
+                'processed_at': datetime.now().isoformat(),
+            }
+
+            for json_file in json_files:
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    chunk_data = json.load(f)
+                    merged_text.append(chunk_data.get('transcription', {}).get('text', ''))
+                    merged_metadata['chunks'].append(chunk_data.get('metadata', {}))
+
+            # Save merged transcript
+            merged_text_path = transcripts_dir / "merged_transcript.txt"
+            with open(merged_text_path, 'w', encoding='utf-8') as f:
+                f.write("\n".join(merged_text))
+
+            # Save merged metadata
+            merged_metadata_path = transcripts_dir / "merged_metadata.json"
+            with open(merged_metadata_path, 'w', encoding='utf-8') as f:
+                json.dump(merged_metadata, f, indent=2)
+
+            logger.info(f"Task {task.id}: Successfully merged transcripts")
+            return True
+
+        except Exception as e:
+            logger.error(f"Task {task.id}: Failed to merge transcripts: {str(e)}")
+            return False
